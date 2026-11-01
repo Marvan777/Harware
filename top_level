@@ -1,0 +1,204 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity top_level is
+    port (
+        clk         : in    std_logic;
+        btn_reset   : in    std_logic;
+
+        -- PAJ7620U2 Gesture Sensor
+        scl         : inout std_logic;
+        sda         : inout std_logic;
+
+        -- Status LEDs
+        led_granted : out std_logic;
+        led_denied  : out std_logic;
+        led_locked  : out std_logic;
+        led_wifi    : out std_logic;
+
+        -- Relay
+        lock_relay  : out std_logic;
+
+        -- 16x2 LCD
+        lcd_rs      : out std_logic;
+        lcd_e       : out std_logic;
+        lcd_data    : out std_logic_vector(7 downto 4);
+
+        -- ESP8266 Wi-Fi
+        wifi_tx     : out std_logic;
+        wifi_rx     : in  std_logic
+    );
+end entity top_level;
+
+architecture Behavioral of top_level is
+
+    --------------------------------------------------
+    -- Gesture Sensor Signals
+    --------------------------------------------------
+    signal gesture_code   : std_logic_vector(3 downto 0);
+    signal gesture_strobe : std_logic := '0';
+
+    signal previous_gesture : std_logic_vector(3 downto 0)
+                              := (others => '0');
+
+    --------------------------------------------------
+    -- Access Control Signals
+    --------------------------------------------------
+    signal granted_i : std_logic;
+    signal denied_i  : std_logic;
+    signal locked_i  : std_logic;
+    signal relay_i   : std_logic;
+
+    --------------------------------------------------
+    -- Reset and Sensor Status
+    --------------------------------------------------
+    signal reset_n_i   : std_logic;
+    signal init_done_i : std_logic;
+    signal i2c_error_i : std_logic;
+
+    --------------------------------------------------
+    -- Wi-Fi Status Signal
+    --------------------------------------------------
+    signal wifi_ready_i : std_logic;
+
+begin
+
+    reset_n_i <= not btn_reset;
+
+    --------------------------------------------------
+    -- Wi-Fi Status LED
+    --------------------------------------------------
+    -- LED ON  = Wi-Fi join acknowledgement detected
+    -- LED OFF = Wi-Fi not confirmed
+    --------------------------------------------------
+    led_wifi <= wifi_ready_i;
+
+    --------------------------------------------------
+    -- PAJ7620 Gesture Sensor Controller
+    --------------------------------------------------
+    U1_SENSOR : entity work.paj7620_controller
+        generic map (
+            CLK_HZ => 50000000
+        )
+        port map (
+            clk          => clk,
+            reset_n      => reset_n_i,
+            scl          => scl,
+            sda          => sda,
+            gesture_code => gesture_code,
+            init_done    => init_done_i,
+            i2c_error    => i2c_error_i
+        );
+
+    --------------------------------------------------
+    -- Gesture Strobe Generator
+    --------------------------------------------------
+    process(clk)
+    begin
+        if rising_edge(clk) then
+
+            if btn_reset = '1' then
+
+                previous_gesture <= (others => '0');
+                gesture_strobe   <= '0';
+
+            else
+
+                gesture_strobe <= '0';
+
+                if gesture_code /= "0000" and
+                   gesture_code /= previous_gesture then
+
+                    gesture_strobe <= '1';
+
+                end if;
+
+                previous_gesture <= gesture_code;
+
+            end if;
+
+        end if;
+    end process;
+
+    --------------------------------------------------
+    -- Access Control FSM
+    --------------------------------------------------
+    U2_FSM : entity work.access_control_fsm
+        port map (
+            clk         => clk,
+            rst         => btn_reset,
+
+            gesture     => gesture_code(2 downto 0),
+            strobe      => gesture_strobe,
+
+            led_granted => granted_i,
+            led_denied  => denied_i,
+            led_locked  => locked_i,
+            lock_relay  => relay_i
+        );
+
+    --------------------------------------------------
+    -- Status LED Outputs
+    --------------------------------------------------
+    led_granted <= granted_i;
+    led_denied  <= denied_i;
+    led_locked  <= locked_i;
+
+    --------------------------------------------------
+    -- Relay Output
+    --------------------------------------------------
+    lock_relay <= relay_i;
+
+    --------------------------------------------------
+    -- 16x2 LCD Controller
+    --------------------------------------------------
+    U3_LCD : entity work.lcd_controller
+        generic map (
+            CLK_HZ => 50000000
+        )
+        port map (
+            clk         => clk,
+            rst         => btn_reset,
+
+            led_granted => granted_i,
+            led_denied  => denied_i,
+            led_locked  => locked_i,
+
+            lcd_rs      => lcd_rs,
+            lcd_e       => lcd_e,
+            lcd_data    => lcd_data
+        );
+
+    --------------------------------------------------
+    -- ESP8266 Wi-Fi Controller
+    --------------------------------------------------
+    U4_WIFI : entity work.wifi_controller
+        generic map (
+            CLK_HZ => 50000000,
+            BAUD   => 115200,
+
+            -- Wi-Fi Network
+            WIFI_SSID     => "Marvan",
+            WIFI_PASSWORD => "marvan22",
+
+            -- Nexus Home Server
+            SERVER_IP   => "10.69.6.248",
+            SERVER_PORT => "8080"
+        )
+        port map (
+            clk       => clk,
+            reset_n   => reset_n_i,
+
+            granted   => granted_i,
+            denied    => denied_i,
+            locked    => locked_i,
+
+            wifi_tx   => wifi_tx,
+            wifi_rx   => wifi_rx,
+
+            wifi_ready => wifi_ready_i
+        );
+
+end architecture Behavioral;
