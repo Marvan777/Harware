@@ -1,0 +1,279 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity lcd_controller is
+    generic (
+        CLK_HZ : positive := 50000000
+    );
+    port (
+        clk         : in  std_logic;
+        rst         : in  std_logic;
+
+        led_granted : in  std_logic;
+        led_denied  : in  std_logic;
+        led_locked  : in  std_logic;
+
+        lcd_rs      : out std_logic;
+        lcd_e       : out std_logic;
+        lcd_data    : out std_logic_vector(7 downto 4)
+    );
+end entity;
+
+architecture Behavioral of lcd_controller is
+
+    -- Timings for 50 MHz FPGA clock
+    constant POWER_DELAY : natural := CLK_HZ / 20;
+    constant CMD_DELAY   : natural := CLK_HZ / 500;
+    constant PULSE_DELAY : natural := CLK_HZ / 100000;
+    constant REFRESH_DELAY : natural := CLK_HZ / 20;
+
+    type state_type is (
+        POWER_WAIT,
+        LOAD_DATA,
+        SETUP,
+        ENABLE_HIGH,
+        ENABLE_LOW,
+        WAIT_COMMAND,
+        REFRESH
+    );
+
+    signal state : state_type := POWER_WAIT;
+
+    signal counter : natural range 0 to POWER_DELAY := 0;
+
+    signal index_i : integer range 0 to 42 := 0;
+    signal nibble_phase : std_logic := '0';
+
+    signal tx_data : std_logic_vector(7 downto 0)
+                     := (others => '0');
+    signal tx_rs : std_logic := '0';
+    signal single_nibble : std_logic := '0';
+
+    signal rs_i : std_logic := '0';
+    signal e_i  : std_logic := '0';
+    signal data_i : std_logic_vector(7 downto 4)
+                    := (others => '0');
+
+    signal status : std_logic_vector(1 downto 0);
+
+    function char_to_slv(c : character)
+        return std_logic_vector is
+    begin
+        return std_logic_vector(
+            to_unsigned(character'pos(c), 8)
+        );
+    end function;
+
+    function display_char(
+        s : std_logic_vector(1 downto 0);
+        line_num : integer;
+        pos : integer
+    ) return std_logic_vector is
+
+        variable line_text :
+            string(1 to 16) := (others => ' ');
+
+    begin
+
+        if s = "11" then
+            if line_num = 1 then
+                line_text := "SYSTEM LOCKED   ";
+            else
+                line_text := "HARD LOCKED     ";
+            end if;
+
+        elsif s = "01" then
+            if line_num = 1 then
+                line_text := "ACCESS GRANTED  ";
+            else
+                line_text := "UNLOCKED        ";
+            end if;
+
+        elsif s = "10" then
+            if line_num = 1 then
+                line_text := "ACCESS DENIED   ";
+            else
+                line_text := "LOCKED          ";
+            end if;
+
+        else
+            if line_num = 1 then
+                line_text := "GESTURE SECURITY";
+            else
+                line_text := "LOCKED          ";
+            end if;
+        end if;
+
+        return char_to_slv(line_text(pos + 1));
+
+    end function;
+
+begin
+
+    lcd_rs   <= rs_i;
+    lcd_e    <= e_i;
+    lcd_data <= data_i;
+
+    -- Priority: hard locked > denied > granted
+    status <= "11" when led_locked = '1' else
+              "10" when led_denied = '1' else
+              "01" when led_granted = '1' else
+              "00";
+
+    process(clk, rst)
+    begin
+        if rst = '1' then
+            state <= POWER_WAIT;
+            counter <= 0;
+            index_i <= 0;
+            nibble_phase <= '0';
+            tx_data <= (others => '0');
+            tx_rs <= '0';
+            single_nibble <= '0';
+            rs_i <= '0';
+            e_i <= '0';
+            data_i <= (others => '0');
+
+        elsif rising_edge(clk) then
+
+            case state is
+
+                when POWER_WAIT =>
+                    e_i <= '0';
+
+                    if counter >= POWER_DELAY then
+                        counter <= 0;
+                        index_i <= 0;
+                        state <= LOAD_DATA;
+                    else
+                        counter <= counter + 1;
+                    end if;
+
+                when LOAD_DATA =>
+                    e_i <= '0';
+                    counter <= 0;
+                    nibble_phase <= '0';
+                    tx_rs <= '0';
+                    single_nibble <= '0';
+
+                    case index_i is
+                        -- HD44780 initialization
+                        when 0 | 1 | 2 =>
+                            tx_data <= X"30";
+                            single_nibble <= '1';
+
+                        when 3 =>
+                            tx_data <= X"20";
+                            single_nibble <= '1';
+
+                        when 4 =>
+                            tx_data <= X"28"; -- 4-bit, 2-line
+
+                        when 5 =>
+                            tx_data <= X"08"; -- Display OFF
+
+                        when 6 =>
+                            tx_data <= X"01"; -- Clear
+
+                        when 7 =>
+                            tx_data <= X"06"; -- Entry mode
+
+                        when 8 =>
+                            tx_data <= X"0C"; -- Display ON
+
+                        when 9 =>
+                            tx_data <= X"80"; -- Line 1
+
+                        when 10 to 25 =>
+                            tx_data <= display_char(
+                                status, 1, index_i - 10
+                            );
+                            tx_rs <= '1';
+
+                        when 26 =>
+                            tx_data <= X"C0"; -- Line 2
+
+                        when 27 to 42 =>
+                            tx_data <= display_char(
+                                status, 2, index_i - 27
+                            );
+                            tx_rs <= '1';
+
+                        when others =>
+                            tx_data <= X"80";
+                    end case;
+
+                    state <= SETUP;
+
+                when SETUP =>
+                    rs_i <= tx_rs;
+                    e_i <= '0';
+
+                    if nibble_phase = '0' then
+                        data_i <= tx_data(7 downto 4);
+                    else
+                        data_i <= tx_data(3 downto 0);
+                    end if;
+
+                    counter <= 0;
+                    state <= ENABLE_HIGH;
+
+                when ENABLE_HIGH =>
+                    e_i <= '1';
+
+                    if counter >= PULSE_DELAY then
+                        counter <= 0;
+                        state <= ENABLE_LOW;
+                    else
+                        counter <= counter + 1;
+                    end if;
+
+                when ENABLE_LOW =>
+                    e_i <= '0';
+
+                    if nibble_phase = '0' and
+                       single_nibble = '0' then
+                        nibble_phase <= '1';
+                        state <= SETUP;
+                    else
+                        nibble_phase <= '0';
+                        counter <= 0;
+                        state <= WAIT_COMMAND;
+                    end if;
+
+                when WAIT_COMMAND =>
+                    e_i <= '0';
+
+                    if counter >= CMD_DELAY then
+                        counter <= 0;
+
+                        if index_i = 42 then
+                            state <= REFRESH;
+                        else
+                            index_i <= index_i + 1;
+                            state <= LOAD_DATA;
+                        end if;
+                    else
+                        counter <= counter + 1;
+                    end if;
+
+                when REFRESH =>
+                    e_i <= '0';
+
+                    if counter >= REFRESH_DELAY then
+                        counter <= 0;
+                        index_i <= 9;
+                        state <= LOAD_DATA;
+                    else
+                        counter <= counter + 1;
+                    end if;
+
+            end case;
+
+        end if;
+    end process;
+
+end architecture Behavioral;
+
