@@ -1,0 +1,162 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity paj7620_controller is
+    generic (CLK_HZ : positive := 50_000_000);
+    port (
+        clk : in std_logic;
+        reset_n : in std_logic;
+        scl : inout std_logic;
+        sda : inout std_logic;
+        gesture_code : out std_logic_vector(3 downto 0);
+        init_done : out std_logic;
+        i2c_error : out std_logic
+    );
+end entity;
+
+architecture rtl of paj7620_controller is
+    type reg_pair_t is record
+        reg_addr : std_logic_vector(7 downto 0);
+        reg_data : std_logic_vector(7 downto 0);
+    end record;
+    type init_table_t is array(natural range <>) of reg_pair_t;
+    constant INIT_TABLE : init_table_t := (
+        (X"EF",X"00"),(X"37",X"07"),(X"38",X"17"),
+        (X"39",X"06"),(X"42",X"01"),(X"46",X"2D"),
+        (X"47",X"0F"),(X"48",X"3C"),(X"49",X"00"),
+        (X"4A",X"1E"),(X"4C",X"20"),(X"51",X"10"),
+        (X"5E",X"10"),(X"60",X"27"),(X"80",X"42"),
+        (X"81",X"44"),(X"82",X"04"),(X"8B",X"01"),
+        (X"90",X"06"),(X"95",X"0A"),(X"96",X"0C"),
+        (X"97",X"05"),(X"9A",X"14"),(X"9C",X"3F"),
+        (X"A5",X"19"),(X"CC",X"19"),(X"CD",X"0B"),
+        (X"CE",X"13"),(X"CF",X"64"),(X"D0",X"21"),
+        (X"EF",X"01"),(X"02",X"0F"),(X"03",X"10"),
+        (X"04",X"02"),(X"25",X"01"),(X"27",X"39"),
+        (X"28",X"7F"),(X"29",X"08"),(X"3E",X"FF"),
+        (X"5E",X"3D"),(X"65",X"96"),(X"67",X"97"),
+        (X"69",X"CD"),(X"6A",X"01"),(X"6D",X"2C"),
+        (X"6E",X"01"),(X"73",X"35"),(X"74",X"00"),
+        (X"77",X"01"),(X"72",X"01"),(X"EF",X"00")
+    );
+    type state_t is (
+        POWER_WAIT, INIT_LAUNCH, INIT_BUSY, INIT_DONE_WAIT,
+        POLL_WAIT, READ_LAUNCH, READ_BUSY, READ_DONE_WAIT, FAILED
+    );
+    signal state : state_t := POWER_WAIT;
+    signal idx : natural range 0 to INIT_TABLE'high := 0;
+    signal delay_ctr : natural range 0 to CLK_HZ/1000 := 0;
+    signal poll_ctr : natural range 0 to CLK_HZ/50 := 0;
+    signal eng_start : std_logic := '0';
+    signal eng_read : std_logic := '0';
+    signal eng_reg : std_logic_vector(7 downto 0) := (others => '0');
+    signal eng_wdata : std_logic_vector(7 downto 0) := (others => '0');
+    signal eng_rdata : std_logic_vector(7 downto 0);
+    signal eng_busy, eng_err : std_logic;
+    signal gesture_i : std_logic_vector(3 downto 0) := (others => '0');
+    signal initialized : std_logic := '0';
+    signal error_i : std_logic := '0';
+begin
+    gesture_code <= gesture_i;
+    init_done <= initialized;
+    i2c_error <= error_i;
+
+    I2C_ENGINE : entity work.paj7620_i2c
+        generic map (INPUT_CLK_HZ => CLK_HZ, I2C_CLK_HZ => 100_000)
+        port map (
+            clk => clk, reset_n => reset_n, start => eng_start,
+            is_read => eng_read, reg_addr => eng_reg,
+            write_data => eng_wdata, read_data => eng_rdata,
+            busy => eng_busy, ack_error => eng_err,
+            scl => scl, sda => sda
+        );
+
+    process(clk, reset_n)
+        variable detected : std_logic_vector(3 downto 0);
+    begin
+        if reset_n = '0' then
+            state <= POWER_WAIT;
+            idx <= 0;
+            delay_ctr <= 0;
+            poll_ctr <= 0;
+            eng_start <= '0';
+            eng_read <= '0';
+            eng_reg <= (others => '0');
+            eng_wdata <= (others => '0');
+            gesture_i <= (others => '0');
+            initialized <= '0';
+            error_i <= '0';
+        elsif rising_edge(clk) then
+            eng_start <= '0';
+            case state is
+                when POWER_WAIT =>
+                    if delay_ctr = CLK_HZ/1000 then
+                        delay_ctr <= 0;
+                        state <= INIT_LAUNCH;
+                    else
+                        delay_ctr <= delay_ctr + 1;
+                    end if;
+                when INIT_LAUNCH =>
+                    if eng_busy = '0' then
+                        eng_read <= '0';
+                        eng_reg <= INIT_TABLE(idx).reg_addr;
+                        eng_wdata <= INIT_TABLE(idx).reg_data;
+                        eng_start <= '1';
+                        state <= INIT_BUSY;
+                    end if;
+                when INIT_BUSY =>
+                    if eng_busy = '1' then state <= INIT_DONE_WAIT; end if;
+                when INIT_DONE_WAIT =>
+                    if eng_busy = '0' then
+                        if eng_err = '1' then
+                            error_i <= '1'; state <= FAILED;
+                        elsif idx = INIT_TABLE'high then
+                            initialized <= '1';
+                            poll_ctr <= 0; state <= POLL_WAIT;
+                        else
+                            idx <= idx + 1; state <= INIT_LAUNCH;
+                        end if;
+                    end if;
+                when POLL_WAIT =>
+                    if poll_ctr = CLK_HZ/50 then
+                        poll_ctr <= 0; state <= READ_LAUNCH;
+                    else
+                        poll_ctr <= poll_ctr + 1;
+                    end if;
+                when READ_LAUNCH =>
+                    if eng_busy = '0' then
+                        eng_read <= '1'; eng_reg <= X"43";
+                        eng_start <= '1'; state <= READ_BUSY;
+                    end if;
+                when READ_BUSY =>
+                    if eng_busy = '1' then state <= READ_DONE_WAIT; end if;
+                when READ_DONE_WAIT =>
+                    if eng_busy = '0' then
+                        if eng_err = '1' then
+                            error_i <= '1'; gesture_i <= "0000";
+                            state <= FAILED;
+                        else
+                            detected := "0000";
+                            if eng_rdata(0) = '1' then detected := "0100";
+                            elsif eng_rdata(1) = '1' then detected := "0011";
+                            elsif eng_rdata(2) = '1' then detected := "0001";
+                            elsif eng_rdata(3) = '1' then detected := "0010";
+                            elsif eng_rdata(4) = '1' then detected := "0101";
+                            elsif eng_rdata(5) = '1' then detected := "0110";
+                            elsif eng_rdata(6) = '1' then detected := "0111";
+                            elsif eng_rdata(7) = '1' then detected := "1000";
+                            end if;
+                            gesture_i <= detected;
+                            poll_ctr <= 0; state <= POLL_WAIT;
+                        end if;
+                    end if;
+                when FAILED =>
+                    gesture_i <= "0000";
+                    initialized <= '0';
+            end case;
+        end if;
+    end process;
+end architecture;
+
+
