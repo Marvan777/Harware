@@ -1,0 +1,706 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity wifi_controller is
+    generic (
+        CLK_HZ        : positive := 50000000;
+        BAUD          : positive := 115200;
+
+        WIFI_SSID     : string := "Marvan";
+        WIFI_PASSWORD : string := "marvan22";
+
+        SERVER_IP     : string := "10.69.6.248";
+        SERVER_PORT   : string := "8080"
+    );
+    port (
+        clk        : in  std_logic;
+        reset_n    : in  std_logic;
+
+        granted    : in  std_logic;
+        denied     : in  std_logic;
+        locked     : in  std_logic;
+
+        wifi_tx    : out std_logic;
+        wifi_rx    : in  std_logic;
+        wifi_ready : out std_logic
+    );
+end entity wifi_controller;
+
+architecture Behavioral of wifi_controller is
+
+    subtype byte_t is std_logic_vector(7 downto 0);
+
+    constant CRLF : string :=
+        character'val(13) & character'val(10);
+
+    --------------------------------------------------
+    -- NUMBER TO STRING
+    --------------------------------------------------
+    function decimal(n : natural) return string is
+    begin
+        return integer'image(integer(n));
+    end function;
+
+    --------------------------------------------------
+    -- ESP8266 AT COMMANDS
+    --------------------------------------------------
+    constant C_AT : string :=
+        "AT" & CRLF;
+
+    constant C_ECHO : string :=
+        "AT" & CRLF;
+
+    constant C_MODE : string :=
+        "AT+CWMODE=1" & CRLF;
+
+    constant C_JOIN : string :=
+        "AT+CWJAP=""" & WIFI_SSID &
+        """,""" & WIFI_PASSWORD & """" & CRLF;
+
+    constant C_OPEN : string :=
+        "AT+CIPSTART=""TCP"",""" &
+        SERVER_IP & """," & SERVER_PORT & CRLF;
+
+    constant C_CLOSE : string :=
+        "AT+CIPCLOSE" & CRLF;
+
+    --------------------------------------------------
+    -- JSON EVENT MESSAGES
+    --------------------------------------------------
+    constant J_GRANTED : string :=
+        "{""type"":""access_granted""}";
+
+    constant J_DENIED : string :=
+        "{""type"":""access_denied""}";
+
+    constant J_LOCKED : string :=
+        "{""type"":""locked""}";
+
+    --------------------------------------------------
+    -- HTTP REQUEST HEADER
+    --------------------------------------------------
+    constant H_PREFIX : string :=
+        "POST /api/event HTTP/1.1" & CRLF &
+        "Host: " & SERVER_IP & ":" &
+        SERVER_PORT & CRLF &
+        "Content-Type: application/json" & CRLF &
+        "Content-Length: ";
+
+    constant H_SUFFIX : string :=
+        CRLF &
+        "Connection: close" & CRLF &
+        CRLF;
+
+    --------------------------------------------------
+    -- COMPLETE HTTP REQUESTS
+    --------------------------------------------------
+    constant H_GRANTED : string :=
+        H_PREFIX &
+        decimal(J_GRANTED'length) &
+        H_SUFFIX &
+        J_GRANTED;
+
+    constant H_DENIED : string :=
+        H_PREFIX &
+        decimal(J_DENIED'length) &
+        H_SUFFIX &
+        J_DENIED;
+
+    constant H_LOCKED : string :=
+        H_PREFIX &
+        decimal(J_LOCKED'length) &
+        H_SUFFIX &
+        J_LOCKED;
+
+    --------------------------------------------------
+    -- ESP8266 CIPSEND COMMANDS
+    --------------------------------------------------
+    constant S_GRANTED : string :=
+        "AT+CIPSEND=" &
+        decimal(H_GRANTED'length) & CRLF;
+
+    constant S_DENIED : string :=
+        "AT+CIPSEND=" &
+        decimal(H_DENIED'length) & CRLF;
+
+    constant S_LOCKED : string :=
+        "AT+CIPSEND=" &
+        decimal(H_LOCKED'length) & CRLF;
+
+    --------------------------------------------------
+    -- CHARACTER TO UART BYTE
+    --------------------------------------------------
+    function char_at(
+        s     : string;
+        index : natural
+    ) return byte_t is
+    begin
+        if index >= 1 and index <= s'length then
+
+            return std_logic_vector(
+                to_unsigned(
+                    character'pos(
+                        s(s'low + index - 1)
+                    ),
+                    8
+                )
+            );
+
+        else
+            return x"00";
+        end if;
+    end function;
+
+    --------------------------------------------------
+    -- COMMAND LENGTH SELECTOR
+    --------------------------------------------------
+    function cmd_len(
+        stage_no : natural;
+        ev       : natural
+    ) return natural is
+    begin
+        case stage_no is
+
+            when 0 =>
+                return C_AT'length;
+
+            when 1 =>
+                return C_ECHO'length;
+
+            when 2 =>
+                return C_MODE'length;
+
+            when 3 =>
+                return C_JOIN'length;
+
+            when 4 =>
+                return C_OPEN'length;
+
+            when 5 =>
+                case ev is
+                    when 1 =>
+                        return S_GRANTED'length;
+                    when 2 =>
+                        return S_DENIED'length;
+                    when others =>
+                        return S_LOCKED'length;
+                end case;
+
+            when 6 =>
+                case ev is
+                    when 1 =>
+                        return H_GRANTED'length;
+                    when 2 =>
+                        return H_DENIED'length;
+                    when others =>
+                        return H_LOCKED'length;
+                end case;
+
+            when others =>
+                return C_CLOSE'length;
+
+        end case;
+    end function;
+
+    --------------------------------------------------
+    -- COMMAND BYTE SELECTOR
+    --------------------------------------------------
+    function cmd_byte(
+        stage_no : natural;
+        ev       : natural;
+        index    : natural
+    ) return byte_t is
+    begin
+        case stage_no is
+
+            when 0 =>
+                return char_at(C_AT, index);
+
+            when 1 =>
+                return char_at(C_ECHO, index);
+
+            when 2 =>
+                return char_at(C_MODE, index);
+
+            when 3 =>
+                return char_at(C_JOIN, index);
+
+            when 4 =>
+                return char_at(C_OPEN, index);
+
+            when 5 =>
+                case ev is
+                    when 1 =>
+                        return char_at(S_GRANTED, index);
+                    when 2 =>
+                        return char_at(S_DENIED, index);
+                    when others =>
+                        return char_at(S_LOCKED, index);
+                end case;
+
+            when 6 =>
+                case ev is
+                    when 1 =>
+                        return char_at(H_GRANTED, index);
+                    when 2 =>
+                        return char_at(H_DENIED, index);
+                    when others =>
+                        return char_at(H_LOCKED, index);
+                end case;
+
+            when others =>
+                return char_at(C_CLOSE, index);
+
+        end case;
+    end function;
+
+    --------------------------------------------------
+    -- CONTROLLER STATE MACHINE
+    --------------------------------------------------
+    type state_type is (
+        BOOT_WAIT,
+        START_COMMAND,
+        SEND_BYTE,
+        WAIT_BUSY,
+        WAIT_DONE,
+        WAIT_REPLY,
+        ONLINE_IDLE
+    );
+
+    signal state : state_type := BOOT_WAIT;
+
+    -- Stages:
+    -- 0 = AT
+    -- 1 = ATE0
+    -- 2 = CWMODE
+    -- 3 = CWJAP
+    -- 4 = CIPSTART
+    -- 5 = CIPSEND
+    -- 6 = HTTP DATA
+    -- 7 = CIPCLOSE
+
+    signal stage : natural range 0 to 7 := 0;
+
+    signal byte_index : natural range 1 to 512 := 1;
+
+    --------------------------------------------------
+    -- ACCESS EVENTS
+    --------------------------------------------------
+    signal event_id : natural range 1 to 3 := 1;
+    signal pending  : natural range 0 to 3 := 0;
+
+    signal prev_g : std_logic := '0';
+    signal prev_d : std_logic := '0';
+    signal prev_l : std_logic := '0';
+
+    --------------------------------------------------
+    -- UART TRANSMITTER
+    --------------------------------------------------
+    signal tx_start : std_logic := '0';
+    signal tx_busy  : std_logic;
+
+    signal tx_data : byte_t := x"00";
+
+    --------------------------------------------------
+    -- UART RECEIVER
+    --------------------------------------------------
+    signal rx_data  : byte_t;
+    signal rx_valid : std_logic;
+
+    --------------------------------------------------
+    -- RESPONSE DETECTION
+    --------------------------------------------------
+    signal previous_rx : byte_t := x"00";
+
+    signal rx_history :
+        std_logic_vector(47 downto 0) :=
+        (others => '0');
+
+    signal ok_seen     : std_logic := '0';
+    signal prompt_seen : std_logic := '0';
+    signal error_seen  : std_logic := '0';
+    signal send_seen   : std_logic := '0';
+
+    --------------------------------------------------
+    -- TIMERS AND STATUS
+    --------------------------------------------------
+    signal timer :
+        natural range 0 to CLK_HZ * 20 := 0;
+
+    signal wifi_ready_i : std_logic := '0';
+
+begin
+
+    --------------------------------------------------
+    -- WIFI STATUS OUTPUT
+    --------------------------------------------------
+    wifi_ready <= wifi_ready_i;
+
+    --------------------------------------------------
+    -- UART TX MODULE
+    --------------------------------------------------
+    U_TX : entity work.uart_tx
+        generic map (
+            CLK_HZ => CLK_HZ,
+            BAUD   => BAUD
+        )
+        port map (
+            clk     => clk,
+            reset_n => reset_n,
+            start   => tx_start,
+            data_in => tx_data,
+            tx      => wifi_tx,
+            busy    => tx_busy
+        );
+
+    --------------------------------------------------
+    -- UART RX MODULE
+    --------------------------------------------------
+    U_RX : entity work.uart_rx
+        generic map (
+            CLK_HZ => CLK_HZ,
+            BAUD   => BAUD
+        )
+        port map (
+            clk      => clk,
+            reset_n  => reset_n,
+            rx       => wifi_rx,
+            data_out => rx_data,
+            valid    => rx_valid
+        );
+
+    --------------------------------------------------
+    -- MAIN ESP8266 CONTROLLER
+    --------------------------------------------------
+    process(clk)
+
+        variable reply_ok : boolean;
+
+    begin
+        if rising_edge(clk) then
+
+            tx_start <= '0';
+
+            if reset_n = '0' then
+
+                state <= BOOT_WAIT;
+
+                stage <= 0;
+                byte_index <= 1;
+                timer <= 0;
+
+                event_id <= 1;
+                pending <= 0;
+
+                prev_g <= '0';
+                prev_d <= '0';
+                prev_l <= '0';
+
+                tx_data <= x"00";
+
+                previous_rx <= x"00";
+                rx_history <= (others => '0');
+
+                ok_seen <= '0';
+                prompt_seen <= '0';
+                error_seen <= '0';
+                send_seen <= '0';
+
+                wifi_ready_i <= '0';
+
+            else
+
+                --------------------------------------
+                -- DETECT ACCESS EVENTS
+                --------------------------------------
+                prev_g <= granted;
+                prev_d <= denied;
+                prev_l <= locked;
+
+                if locked = '1' and prev_l = '0' then
+
+                    pending <= 3;
+
+                elsif granted = '1' and prev_g = '0' then
+
+                    pending <= 1;
+
+                elsif denied = '1' and prev_d = '0' then
+
+                    pending <= 2;
+
+                end if;
+
+                --------------------------------------
+                -- RECEIVE ESP8266 DATA
+                --------------------------------------
+                if rx_valid = '1' then
+
+                    -- Detect "OK"
+                    if previous_rx = x"4F" and
+                       rx_data = x"4B" then
+
+                        ok_seen <= '1';
+
+                    end if;
+
+                    -- Detect ">" prompt
+                    if rx_data = x"3E" then
+
+                        prompt_seen <= '1';
+
+                    end if;
+
+                    -- Detect complete "ERROR"
+                    if rx_history(31 downto 0) =
+                       x"4552524F" and
+                       rx_data = x"52" then
+
+                        error_seen <= '1';
+
+                    end if;
+
+                    -- Detect "SEND OK"
+                    if rx_history =
+                       x"53454E44204F" and
+                       rx_data = x"4B" then
+
+                        send_seen <= '1';
+
+                    end if;
+
+                    rx_history <=
+                        rx_history(39 downto 0) &
+                        rx_data;
+
+                    previous_rx <= rx_data;
+
+                end if;
+
+                --------------------------------------
+                -- CONTROLLER STATE MACHINE
+                --------------------------------------
+                case state is
+
+                    ----------------------------------
+                    -- INITIAL ESP8266 BOOT DELAY
+                    ----------------------------------
+                    when BOOT_WAIT =>
+
+                        if timer < CLK_HZ * 3 then
+
+                            timer <= timer + 1;
+
+                        else
+
+                            timer <= 0;
+                            stage <= 0;
+
+                            state <= START_COMMAND;
+
+                        end if;
+
+                    ----------------------------------
+                    -- PREPARE NEXT COMMAND
+                    ----------------------------------
+                    when START_COMMAND =>
+
+                        byte_index <= 1;
+                        timer <= 0;
+
+                        ok_seen <= '0';
+                        prompt_seen <= '0';
+                        error_seen <= '0';
+                        send_seen <= '0';
+
+                        state <= SEND_BYTE;
+
+                    ----------------------------------
+                    -- TRANSMIT NEXT BYTE
+                    ----------------------------------
+                    when SEND_BYTE =>
+
+                        if tx_busy = '0' then
+
+                            tx_data <= cmd_byte(
+                                stage,
+                                event_id,
+                                byte_index
+                            );
+
+                            tx_start <= '1';
+
+                            state <= WAIT_BUSY;
+
+                        end if;
+
+                    ----------------------------------
+                    -- WAIT FOR TX START
+                    ----------------------------------
+                    when WAIT_BUSY =>
+
+                        if tx_busy = '1' then
+
+                            state <= WAIT_DONE;
+
+                        end if;
+
+                    ----------------------------------
+                    -- WAIT FOR TX COMPLETION
+                    ----------------------------------
+                    when WAIT_DONE =>
+
+                        if tx_busy = '0' then
+
+                            if byte_index <
+                               cmd_len(stage, event_id) then
+
+                                byte_index <= byte_index + 1;
+
+                                state <= SEND_BYTE;
+
+                            else
+
+                                timer <= 0;
+
+                                state <= WAIT_REPLY;
+
+                            end if;
+
+                        end if;
+
+                    ----------------------------------
+                    -- PROCESS ESP8266 REPLY
+                    ----------------------------------
+                    when WAIT_REPLY =>
+
+                        reply_ok := false;
+
+                        if stage = 5 then
+
+                            -- Wait for CIPSEND prompt
+                            if prompt_seen = '1' then
+                                reply_ok := true;
+                            end if;
+
+                        elsif stage = 6 then
+
+                            -- Wait for SEND OK
+                            if send_seen = '1' then
+                                reply_ok := true;
+                            end if;
+
+                        else
+
+                            -- Other commands expect OK
+                            if ok_seen = '1' then
+                                reply_ok := true;
+                            end if;
+
+                        end if;
+
+                        if reply_ok then
+
+                            timer <= 0;
+
+                            ----------------------------------
+                            -- AT DIAGNOSTIC COMPLETED
+                            ----------------------------------
+                            if stage = 0 then
+
+                                -- AT acknowledged
+                                -- Do not turn LED ON
+                                stage <= 1;
+                                state <= START_COMMAND;
+
+                            ----------------------------------
+                            -- WIFI MODE CONFIGURATION
+                            ----------------------------------
+                            elsif stage = 2 then
+
+                                -- CWMODE acknowledged
+                                -- Do not turn LED ON yet
+                                
+                                stage <= 3;
+                                state <= START_COMMAND;
+
+                            ----------------------------------
+                            -- WIFI JOIN CONFIRMED
+                            ----------------------------------
+                            elsif stage = 3 then
+
+                                -- CWJAP acknowledged
+                                -- LED ON after successful reply
+                                wifi_ready_i <= '1';
+
+                                stage <= 4;
+                                state <= ONLINE_IDLE;
+
+                            ----------------------------------
+                            -- HTTP TRANSACTION FINISHED
+                            ----------------------------------
+                            elsif stage = 7 then
+
+                                stage <= 4;
+                                state <= ONLINE_IDLE;
+
+                            else
+
+                                stage <= stage + 1;
+                                state <= START_COMMAND;
+
+                            end if;
+
+                        elsif error_seen = '1' or
+                              timer >= CLK_HZ * 19 then
+
+                            if stage = 7 and
+                               wifi_ready_i = '1' then
+
+                                -- Close may report an error
+                                -- when server already closed.
+                                stage <= 4;
+                                timer <= 0;
+                                state <= ONLINE_IDLE;
+
+                            else
+
+                                -- Retry network initialization
+                                stage <= 0;
+                                timer <= 0;
+                                state <= BOOT_WAIT;
+
+                            end if;
+
+                        else
+
+                            timer <= timer + 1;
+
+                        end if;
+
+                    ----------------------------------
+                    -- WAIT FOR NEW FPGA EVENT
+                    ----------------------------------
+                    when ONLINE_IDLE =>
+
+                        if pending /= 0 then
+
+                            event_id <= pending;
+                            pending <= 0;
+
+                            stage <= 4;
+                            state <= START_COMMAND;
+
+                        end if;
+
+                end case;
+
+            end if;
+
+        end if;
+
+    end process;
+
+end architecture Behavioral;
