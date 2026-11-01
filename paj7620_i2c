@@ -1,0 +1,192 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity paj7620_i2c is
+    generic (
+        INPUT_CLK_HZ : positive := 50_000_000;
+        I2C_CLK_HZ   : positive := 100_000
+    );
+    port (
+        clk        : in    std_logic;
+        reset_n    : in    std_logic;
+        start      : in    std_logic;
+        is_read    : in    std_logic;
+        reg_addr   : in    std_logic_vector(7 downto 0);
+        write_data : in    std_logic_vector(7 downto 0);
+        read_data  : out   std_logic_vector(7 downto 0);
+        busy       : out   std_logic;
+        ack_error  : out   std_logic;
+        scl        : inout std_logic;
+        sda        : inout std_logic
+    );
+end entity;
+
+architecture rtl of paj7620_i2c is
+    constant DIVIDER : positive := INPUT_CLK_HZ / (I2C_CLK_HZ * 4);
+    constant PAJ_ADDR : std_logic_vector(6 downto 0) := "1110011";
+    type state_t is (
+        IDLE, START_1, START_2, START_3,
+        BIT_SETUP, BIT_RISE, BIT_HIGH, BIT_FALL,
+        ACK_SETUP, ACK_RISE, ACK_SAMPLE, ACK_FALL,
+        REP_1, REP_2, REP_3, REP_4,
+        RX_SETUP, RX_RISE, RX_SAMPLE, RX_FALL,
+        NACK_SETUP, NACK_RISE, NACK_HIGH, NACK_FALL,
+        STOP_1, STOP_2, STOP_3, FINISH
+    );
+    signal state : state_t := IDLE;
+    signal div_count : natural range 0 to DIVIDER-1 := 0;
+    signal scl_low : std_logic := '0';
+    signal sda_low : std_logic := '0';
+    signal busy_i : std_logic := '0';
+    signal err_i : std_logic := '0';
+    signal rd_i : std_logic := '0';
+    signal reg_i : std_logic_vector(7 downto 0) := (others => '0');
+    signal data_i : std_logic_vector(7 downto 0) := (others => '0');
+    signal tx : std_logic_vector(7 downto 0) := (others => '0');
+    signal rx : std_logic_vector(7 downto 0) := (others => '0');
+    signal bit_no : integer range 0 to 7 := 7;
+    -- 0: address write, 1: register, 2: data or address read
+    signal stage : integer range 0 to 2 := 0;
+begin
+    assert INPUT_CLK_HZ >= I2C_CLK_HZ * 4
+        report "Input clock too slow for I2C divider" severity failure;
+    scl <= '0' when scl_low = '1' else 'Z';
+    sda <= '0' when sda_low = '1' else 'Z';
+    busy <= busy_i;
+    ack_error <= err_i;
+    read_data <= rx;
+
+    process(clk, reset_n)
+    begin
+        if reset_n = '0' then
+            state <= IDLE;
+            div_count <= 0;
+            scl_low <= '0';
+            sda_low <= '0';
+            busy_i <= '0';
+            err_i <= '0';
+            rd_i <= '0';
+            reg_i <= (others => '0');
+            data_i <= (others => '0');
+            tx <= (others => '0');
+            rx <= (others => '0');
+            bit_no <= 7;
+            stage <= 0;
+        elsif rising_edge(clk) then
+            -- Accept a request immediately, independently of the I2C divider.
+            if state = IDLE then
+                div_count <= 0;
+                scl_low <= '0';
+                sda_low <= '0';
+                busy_i <= '0';
+                if start = '1' then
+                    busy_i <= '1';
+                    err_i <= '0';
+                    rd_i <= is_read;
+                    reg_i <= reg_addr;
+                    data_i <= write_data;
+                    stage <= 0;
+                    state <= START_1;
+                end if;
+            elsif div_count = DIVIDER-1 then
+                div_count <= 0;
+                case state is
+                    when START_1 =>
+                        scl_low <= '0'; sda_low <= '0'; state <= START_2;
+                    when START_2 =>
+                        sda_low <= '1'; state <= START_3;
+                    when START_3 =>
+                        scl_low <= '1'; tx <= PAJ_ADDR & '0';
+                        bit_no <= 7; state <= BIT_SETUP;
+                    when BIT_SETUP =>
+                        scl_low <= '1';
+                        if tx(bit_no) = '0' then sda_low <= '1';
+                        else sda_low <= '0'; end if;
+                        state <= BIT_RISE;
+                    when BIT_RISE =>
+                        scl_low <= '0'; state <= BIT_HIGH;
+                    when BIT_HIGH =>
+                        state <= BIT_FALL;
+                    when BIT_FALL =>
+                        scl_low <= '1';
+                        if bit_no = 0 then state <= ACK_SETUP;
+                        else bit_no <= bit_no - 1; state <= BIT_SETUP; end if;
+                    when ACK_SETUP =>
+                        scl_low <= '1'; sda_low <= '0'; state <= ACK_RISE;
+                    when ACK_RISE =>
+                        scl_low <= '0'; state <= ACK_SAMPLE;
+                    when ACK_SAMPLE =>
+                        if sda /= '0' then err_i <= '1'; end if;
+                        state <= ACK_FALL;
+                    when ACK_FALL =>
+                        scl_low <= '1';
+                        if sda /= '0' then
+                            -- ACK was sampled in previous state; use registered error.
+                            null;
+                        end if;
+                        if err_i = '1' then
+                            state <= STOP_1;
+                        elsif stage = 0 then
+                            stage <= 1; tx <= reg_i; bit_no <= 7;
+                            state <= BIT_SETUP;
+                        elsif stage = 1 and rd_i = '0' then
+                            stage <= 2; tx <= data_i; bit_no <= 7;
+                            state <= BIT_SETUP;
+                        elsif stage = 1 then
+                            state <= REP_1;
+                        elsif rd_i = '1' then
+                            bit_no <= 7; state <= RX_SETUP;
+                        else
+                            state <= STOP_1;
+                        end if;
+                    when REP_1 =>
+                        scl_low <= '1'; sda_low <= '0'; state <= REP_2;
+                    when REP_2 =>
+                        scl_low <= '0'; state <= REP_3;
+                    when REP_3 =>
+                        sda_low <= '1'; state <= REP_4;
+                    when REP_4 =>
+                        scl_low <= '1'; stage <= 2;
+                        tx <= PAJ_ADDR & '1'; bit_no <= 7;
+                        state <= BIT_SETUP;
+                    when RX_SETUP =>
+                        scl_low <= '1'; sda_low <= '0'; state <= RX_RISE;
+                    when RX_RISE =>
+                        scl_low <= '0'; state <= RX_SAMPLE;
+                    when RX_SAMPLE =>
+                        if sda = '1' then rx(bit_no) <= '1';
+                        elsif sda = '0' then rx(bit_no) <= '0';
+                        else rx(bit_no) <= '0'; err_i <= '1'; end if;
+                        state <= RX_FALL;
+                    when RX_FALL =>
+                        scl_low <= '1';
+                        if bit_no = 0 then state <= NACK_SETUP;
+                        else bit_no <= bit_no - 1; state <= RX_SETUP; end if;
+                    when NACK_SETUP =>
+                        scl_low <= '1'; sda_low <= '0'; state <= NACK_RISE;
+                    when NACK_RISE =>
+                        scl_low <= '0'; state <= NACK_HIGH;
+                    when NACK_HIGH =>
+                        state <= NACK_FALL;
+                    when NACK_FALL =>
+                        scl_low <= '1'; state <= STOP_1;
+                    when STOP_1 =>
+                        scl_low <= '1'; sda_low <= '1'; state <= STOP_2;
+                    when STOP_2 =>
+                        scl_low <= '0'; state <= STOP_3;
+                    when STOP_3 =>
+                        sda_low <= '0'; state <= FINISH;
+                    when FINISH =>
+                        busy_i <= '0'; state <= IDLE;
+                    when others =>
+                        state <= IDLE;
+                end case;
+            else
+                div_count <= div_count + 1;
+            end if;
+        end if;
+    end process;
+end architecture;
+
+
