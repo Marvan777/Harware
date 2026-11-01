@@ -1,0 +1,199 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity access_control_fsm is
+    generic (
+        PULSE_DURATION : positive := 150000000
+    );
+    port (
+        clk         : in  STD_LOGIC;
+        rst         : in  STD_LOGIC;
+        gesture     : in  STD_LOGIC_VECTOR(2 downto 0);
+        strobe      : in  STD_LOGIC;
+
+        led_granted : out STD_LOGIC;
+        led_denied  : out STD_LOGIC;
+        led_locked  : out STD_LOGIC;
+        lock_relay  : out STD_LOGIC
+    );
+end entity access_control_fsm;
+
+architecture Behavioral of access_control_fsm is
+
+    -- FSM States
+    type state_type is (
+        S_IDLE,
+        S_G1,
+        S_G2,
+        S_GRANTED,
+        S_DENIED,
+        S_LOCKED
+    );
+
+    signal current_state : state_type := S_IDLE;
+
+    -- Failed attempt counter
+    signal wrong_attempts : integer range 0 to 3 := 0;
+
+    -- Timer for granted and denied states
+    signal timer : integer range 0 to PULSE_DURATION - 1 := 0;
+
+    -- Gesture definitions
+    constant G_UP    : STD_LOGIC_VECTOR(2 downto 0) := "001";
+    constant G_DOWN  : STD_LOGIC_VECTOR(2 downto 0) := "010";
+    constant G_LEFT  : STD_LOGIC_VECTOR(2 downto 0) := "011";
+    constant G_RIGHT : STD_LOGIC_VECTOR(2 downto 0) := "100";
+
+begin
+
+    --------------------------------------------------
+    -- MAIN FSM PROCESS
+    --------------------------------------------------
+
+    process(clk, rst)
+    begin
+
+        if rst = '1' then
+
+            current_state  <= S_IDLE;
+            wrong_attempts <= 0;
+            timer          <= 0;
+
+        elsif rising_edge(clk) then
+
+            case current_state is
+
+                --------------------------------------
+                -- IDLE: Wait for UP gesture
+                --------------------------------------
+                when S_IDLE =>
+
+                    timer <= 0;
+
+                    if strobe = '1' then
+
+                        if gesture = G_UP then
+                            current_state <= S_G1;
+                        else
+                            current_state <= S_DENIED;
+                            timer <= 0;
+                        end if;
+
+                    end if;
+
+                --------------------------------------
+                -- G1: Wait for RIGHT gesture
+                --------------------------------------
+                when S_G1 =>
+
+                    if strobe = '1' then
+
+                        if gesture = G_RIGHT then
+                            current_state <= S_G2;
+                        else
+                            current_state <= S_DENIED;
+                            timer <= 0;
+                        end if;
+
+                    end if;
+
+                --------------------------------------
+                -- G2: Wait for DOWN gesture
+                --------------------------------------
+                when S_G2 =>
+
+                    if strobe = '1' then
+
+                        timer <= 0;
+
+                        if gesture = G_DOWN then
+                            current_state <= S_GRANTED;
+                        else
+                            current_state <= S_DENIED;
+                        end if;
+
+                    end if;
+
+                --------------------------------------
+                -- ACCESS GRANTED
+                --------------------------------------
+                when S_GRANTED =>
+
+                    if timer = PULSE_DURATION - 1 then
+
+                        timer <= 0;
+                        wrong_attempts <= 0;
+                        current_state <= S_IDLE;
+
+                    else
+                        timer <= timer + 1;
+                    end if;
+
+                --------------------------------------
+                -- ACCESS DENIED
+                --------------------------------------
+                when S_DENIED =>
+
+                    if timer = PULSE_DURATION - 1 then
+
+                        timer <= 0;
+
+                        if wrong_attempts = 2 then
+
+                            wrong_attempts <= 3;
+                            current_state <= S_LOCKED;
+
+                        else
+
+                            wrong_attempts <= wrong_attempts + 1;
+                            current_state <= S_IDLE;
+
+                        end if;
+
+                    else
+                        timer <= timer + 1;
+                    end if;
+
+                --------------------------------------
+                -- SYSTEM LOCKED
+                --------------------------------------
+                when S_LOCKED =>
+
+                    current_state <= S_LOCKED;
+                    timer <= 0;
+
+                --------------------------------------
+                -- DEFAULT
+                --------------------------------------
+                when others =>
+
+                    current_state <= S_IDLE;
+                    timer <= 0;
+
+            end case;
+
+        end if;
+
+    end process;
+
+    --------------------------------------------------
+    -- OUTPUT LOGIC
+    --------------------------------------------------
+
+    led_granted <= '1' when current_state = S_GRANTED
+                   else '0';
+
+    led_denied <= '1' when current_state = S_DENIED
+                  else '0';
+
+    led_locked <= '1' when current_state = S_LOCKED
+                  else '0';
+
+    lock_relay <= '0' when current_state = S_GRANTED
+                  else '1';
+
+end architecture Behavioral;
+
+
